@@ -121,6 +121,15 @@ def _state_bounds_ok(state: StateSnapshot, env: Envelope) -> Tuple[bool, str, st
         if not (xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax):
             return False, "End-effector out of workspace", "EE_WORKSPACE"
 
+        # NEW: Check exclusion zones
+        if env.exclusion_zones:
+            for i, (zmin_tuple, zmax_tuple) in enumerate(env.exclusion_zones):
+                zx1, zy1, zz1 = zmin_tuple
+                zx2, zy2, zz2 = zmax_tuple
+                # Check AABB intersection
+                if (zx1 <= x <= zx2) and (zy1 <= y <= zy2) and (zz1 <= z <= zz2):
+                    return False, f"End-effector inside exclusion zone {i}", "EE_IN_ZONE"
+
     return True, "Bounds OK", "OK"
 
 

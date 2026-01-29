@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 class PerceptionTrust(str, Enum):
@@ -93,9 +93,13 @@ class Envelope:
     primary_authority: Dict[str, str]
 
     # NEW: Acceleration/Dynamics limits
-    # Moved to end to satisfy dataclass requirement (non-default argument follows default argument)
     # If None, infinite acceleration is allowed (risky)
     q_acc_abs_max: Optional[Tuple[float, ...]] = None
+
+    # NEW: Exclusion Zones (List of (min_xyz, max_xyz) tuples)
+    # Example: [((-0.1, -0.1, 0), (0.1, 0.1, 0.5))] defines a forbidden pillar
+    # Using simple AABBs for O(N) decidability
+    exclusion_zones: Optional[List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]] = None
 
 
 @dataclass(frozen=True)

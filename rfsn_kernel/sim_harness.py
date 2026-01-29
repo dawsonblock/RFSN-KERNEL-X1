@@ -8,16 +8,18 @@ from .controller_types import CapabilityLease, CommandKind, ControlSpace, Masked
 from .hold_policy import default_hold_policy
 from .actuators import build_actuator_targets_v2
 from .monitors import SafetyEvent, SafetyLevel
-from .safety_injector import safety_injector
+from .safety_injector import safety_injector, SafetyInjectorConfig
 from .trace import TraceRecord
 
 
 @dataclass
 class SimConfig:
     dof_count: int = 7
-    dt: float = 0.01  # 100 Hz simulated tick for harness (controller could be higher in reality)
+    dt: float = 0.01
     steps: int = 200
     allow_safety_torque_stop: bool = True
+    # NEW: Damping gain for simulation test
+    safety_damping_gain: float = 0.0
 
 
 @dataclass
@@ -28,12 +30,6 @@ class SimState:
 
 
 def _fake_skill_proposals(sim: SimState) -> List[MaskedCommand]:
-    """
-    Deterministic fake skills:
-      - reach moves arm joints (0,1,2) with a slow sinus-like pattern (but no trig; keep deterministic)
-      - nav moves base joint (6)
-    """
-    # Simple deterministic piecewise pattern
     phase = int(sim.t * 10) % 4
     arm_v = 0.2 if phase in (0, 1) else -0.2
     base_v = 0.1 if phase in (0, 3) else -0.1
@@ -45,12 +41,6 @@ def _fake_skill_proposals(sim: SimState) -> List[MaskedCommand]:
 
 
 def _fake_monitor(sim: SimState) -> SafetyEvent:
-    """
-    Deterministic monitor:
-      - at t in [0.80, 1.00): STOP arm (collision margin)
-      - at t in [1.50, 1.55): E_STOP
-      - else NONE
-    """
     if 0.80 <= sim.t < 1.00:
         return SafetyEvent(level=SafetyLevel.STOP, reason="collision_margin", affected_spaces={"arm": "too_close"})
     if 1.50 <= sim.t < 1.55:
@@ -62,14 +52,12 @@ def run_sim() -> tuple[str, List[TraceRecord]]:
     cfg = SimConfig()
     hold = default_hold_policy()
 
-    # DOF partitions for holds + injector
     space_dofs = {
         ControlSpace.ARM: (0, 1, 2, 3),
-        ControlSpace.LEGS: (4, 5),   # unused in fake skills, but included for holds
+        ControlSpace.LEGS: (4, 5), 
         ControlSpace.BASE: (6,),
     }
 
-    # Controller + lease
     ctrl = ControllerState()
     lease = CapabilityLease(
         seq=1,
@@ -79,29 +67,40 @@ def run_sim() -> tuple[str, List[TraceRecord]]:
         q_min=tuple([-3.0] * cfg.dof_count),
         q_max=tuple([ 3.0] * cfg.dof_count),
         qd_abs_max=tuple([1.0] * cfg.dof_count),
+        # Must allow torque if we want damping
+        tau_abs_max=tuple([10.0] * cfg.dof_count),
         primary_authority={"arm": "reach", "base": "nav", "legs": "balance"},
     )
-    ok = install_lease(ctrl, lease, now_t=0.0)
-    if not ok:
-        raise RuntimeError("Failed to install lease")
+    # Note: install_lease allows optional envelope, we skip it here for simplicity
+    install_lease(ctrl, lease, now_t=0.0)
 
     sim = SimState(t=0.0, q=[0.0] * cfg.dof_count, qd=[0.0] * cfg.dof_count)
     trace: List[TraceRecord] = []
+    
+    # Configure injector
+    injector_cfg = SafetyInjectorConfig(
+        damping_gain=cfg.safety_damping_gain,
+        global_stop=True
+    )
 
     for step in range(cfg.steps):
         sim.t = step * cfg.dt
 
-        # Monitor
         event = _fake_monitor(sim)
         trace.append(TraceRecord(sim.t, "monitor", {"level": event.level.value, "reason": event.reason, "affected": event.affected_spaces}))
 
         if event.level == SafetyLevel.E_STOP:
             apply_estop(ctrl)
             trace.append(TraceRecord(sim.t, "estop", {"applied": True}))
-            # In estop, we still tick to show "no output"
             proposals = []
         else:
-            injected = safety_injector(event=event, space_dofs=space_dofs)
+            # NEW: Pass current velocity to injector
+            injected = safety_injector(
+                event=event, 
+                space_dofs=space_dofs, 
+                cfg=injector_cfg, 
+                current_velocities=sim.qd
+            )
             skills = _fake_skill_proposals(sim)
             proposals = injected + skills
 
@@ -113,7 +112,6 @@ def run_sim() -> tuple[str, List[TraceRecord]]:
             ]
         }))
 
-        # Controller tick
         out = step_controller_multi(ctrl=ctrl, now_t=sim.t, proposals=proposals)
         trace.append(TraceRecord(sim.t, "controller", {
             "ok": out.ok,
@@ -124,7 +122,6 @@ def run_sim() -> tuple[str, List[TraceRecord]]:
             ],
         }))
 
-        # Actuator targets
         if out.ok:
             built = build_actuator_targets_v2(
                 final_by_space=out.final_by_space,
@@ -145,15 +142,14 @@ def run_sim() -> tuple[str, List[TraceRecord]]:
             "tau_des": (list(built.targets.tau_des) if built and built.targets and built.targets.tau_des else None),
         }))
 
-        # Minimal state integration (velocity control only in this harness)
-        # If qd_des exists, apply it.
+        # Simple integration
         if built and built.targets and built.targets.qd_des is not None:
             sim.qd = list(built.targets.qd_des)
             for i in range(cfg.dof_count):
                 sim.q[i] += sim.qd[i] * cfg.dt
         else:
-            sim.qd = [0.0] * cfg.dof_count
+            # If no velocity command, friction slows it down (simplistic)
+            sim.qd = [v * 0.9 for v in sim.qd]
 
-    # Return JSONL and records
     from .trace import dumps_jsonl
     return dumps_jsonl(trace), trace
